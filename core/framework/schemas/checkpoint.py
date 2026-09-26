@@ -7,6 +7,7 @@ iterations) to enable crash recovery and resume-from-failure scenarios.
 
 from datetime import datetime
 from typing import Any
+from uuid import uuid4
 
 from pydantic import BaseModel, Field
 
@@ -20,7 +21,7 @@ class Checkpoint(BaseModel):
     """
 
     # Identity
-    checkpoint_id: str  # Format: cp_{type}_{node_id}_{timestamp}
+    checkpoint_id: str  # Format: cp_{type}_{node_id}_{timestamp}_{suffix}
     checkpoint_type: str  # "node_start" | "node_complete" | "loop_iteration"
     session_id: str
     run_id: str | None = None
@@ -80,8 +81,13 @@ class Checkpoint(BaseModel):
         Returns:
             New Checkpoint instance
         """
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        checkpoint_id = f"cp_{checkpoint_type}_{current_node}_{timestamp}"
+        # Sub-second precision plus a random suffix. The store keys checkpoints by
+        # id and writes one file per id, so two checkpoints sharing an id would
+        # silently overwrite each other and desync the index. A whole-second
+        # timestamp is not enough: node_start/node_complete for the same node can
+        # easily land in the same second (fast graphs, retry loops, resumed runs).
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+        checkpoint_id = f"cp_{checkpoint_type}_{current_node}_{timestamp}_{uuid4().hex[:8]}"
 
         if not description:
             description = f"{checkpoint_type.replace('_', ' ').title()}: {current_node}"
@@ -151,8 +157,25 @@ class CheckpointIndex(BaseModel):
     model_config = {"extra": "allow"}
 
     def add_checkpoint(self, checkpoint: Checkpoint) -> None:
-        """Add a checkpoint to the index."""
+        """Add a checkpoint to the index.
+
+        Any existing entries for the same ``checkpoint_id`` are removed and the
+        new summary is appended, so the list stays ordered oldest-to-newest and
+        an id never appears twice. Two properties depend on that:
+
+        * the store writes exactly one file per id, so a duplicated entry would
+          leave ``total_checkpoints`` and ``latest_checkpoint_id`` describing
+          state that cannot be loaded back;
+        * ``get_latest_clean_checkpoint()`` selects the last clean entry, so a
+          re-saved checkpoint that stayed at its original position would be
+          reported as ``latest_checkpoint_id`` while this method returned a
+          different one.
+
+        Dropping-then-appending also repairs an index that a pre-fix collision
+        already duplicated, rather than leaving the duplicate in place.
+        """
         summary = CheckpointSummary.from_checkpoint(checkpoint)
+        self.checkpoints = [existing for existing in self.checkpoints if existing.checkpoint_id != summary.checkpoint_id]
         self.checkpoints.append(summary)
         self.latest_checkpoint_id = checkpoint.checkpoint_id
         self.total_checkpoints = len(self.checkpoints)
